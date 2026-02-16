@@ -5,6 +5,8 @@ frontend/.next
 # Python
 backend/.venv
 backend/__pycache__
+backend/**/__pycache__/
+backend/**/*.pyc
 backend/.pytest_cache
 backend/generated
 
