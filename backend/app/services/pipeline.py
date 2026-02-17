@@ -86,11 +86,21 @@ class NotesPipeline:
 
     def _collect_raw_data(self, youtube_url: str) -> RawPipelineOutput:
         video_id = self._extract_video_id(youtube_url)
-        transcript_entries = self._fetch_transcript_entries(video_id)
-        if not transcript_entries:
-            raise ValueError("No useful transcript text found for this video.")
+        transcript_error: str | None = None
+        transcript_entries: list[TranscriptEntry] = []
+        try:
+            transcript_entries = self._fetch_transcript_entries(video_id)
+        except ValueError as exc:
+            transcript_error = str(exc)
 
         ocr_entries = self._extract_ocr_entries(youtube_url)
+        if not transcript_entries and not ocr_entries:
+            detail = transcript_error or "No useful transcript text found for this video."
+            raise ValueError(
+                f"{detail} Also no OCR text could be extracted. "
+                "Try another video, or install ffmpeg + tesseract for better fallback extraction."
+            )
+
         code_snippets = self._extract_code_candidates(transcript_entries, ocr_entries)
         return RawPipelineOutput(
             transcript_entries=transcript_entries,
@@ -214,10 +224,10 @@ class NotesPipeline:
                 except Exception:
                     continue
 
-                normalized = self._clean_text(raw_text)
-                if len(normalized.split()) < 3:
-                    continue
-                ocr_entries.append(OcrEntry(text=normalized, second=idx * 6))
+                for line in self._normalize_ocr_lines(raw_text):
+                    if len(line.split()) < 2:
+                        continue
+                    ocr_entries.append(OcrEntry(text=line, second=idx * 6))
 
         return self._dedupe_ocr(ocr_entries)
 
@@ -227,7 +237,8 @@ class NotesPipeline:
         ocr_entries: list[OcrEntry],
     ) -> list[str]:
         code_like = re.compile(
-            r"(^\s*#include|^\s*import |int\s+main|return\s+\d+;|for\s*\(|while\s*\(|if\s*\(|console\.log|def\s+)",
+            r"(^\s*#include|^\s*import |int\s+main|return\s+\d+;|for\s*\(|while\s*\(|if\s*\(|console\.log|def\s+|"
+            r"\b(?:int|float|double|char|long|short|bool|string)\b\s+[a-zA-Z_]\w*\s*=.*;|^\s*[{}]\s*$)",
             re.IGNORECASE,
         )
         pool: list[str] = []
@@ -260,7 +271,14 @@ class NotesPipeline:
         language: LanguageMode,
         style: StyleMode,
     ) -> list[TopicNote]:
-        windows = self._topic_windows(raw.transcript_entries, max_topics=5, window_seconds=90)
+        base_entries = raw.transcript_entries
+        if not base_entries and raw.ocr_entries:
+            base_entries = [
+                TranscriptEntry(text=item.text, start=float(item.second), duration=6.0)
+                for item in raw.ocr_entries
+            ]
+
+        windows = self._topic_windows(base_entries, max_topics=5, window_seconds=90)
         topics: list[TopicNote] = []
 
         for index, (start, end, chunk) in enumerate(windows, start=1):
@@ -439,7 +457,7 @@ class NotesPipeline:
         blocks: list[CodeBlock] = []
         for snippet in snippets:
             cleaned = self._clean_code(snippet)
-            if len(cleaned.splitlines()) < 2:
+            if len(cleaned.splitlines()) < 1:
                 continue
             lang = self._guess_language(cleaned)
             blocks.append(
@@ -493,7 +511,8 @@ class NotesPipeline:
     def _looks_code(self, text: str) -> bool:
         return bool(
             re.search(
-                r"(^\s*#include|;\s*$|int\s+main|for\s*\(|while\s*\(|if\s*\(|return\s+\d+;|def\s+|console\.log)",
+                r"(^\s*#include|;\s*$|int\s+main|for\s*\(|while\s*\(|if\s*\(|return\s+\d+;|def\s+|console\.log|"
+                r"\b(?:int|float|double|char|long|short|bool|string)\b\s+[a-zA-Z_]\w*\s*=.*;|^\s*[{}]\s*$)",
                 text,
                 flags=re.IGNORECASE,
             )
@@ -554,6 +573,16 @@ class NotesPipeline:
         lines = [self._clean_text(line) for line in code.splitlines()]
         lines = [line for line in lines if line]
         return "\n".join(lines)
+
+    def _normalize_ocr_lines(self, text: str) -> list[str]:
+        # Preserve line boundaries so code lines like `double x = 5.0;` are not merged away.
+        lines = text.splitlines()
+        out: list[str] = []
+        for line in lines:
+            cleaned = self._clean_text(line)
+            if cleaned:
+                out.append(cleaned)
+        return self._unique_lines(out)
 
     def _clean_text(self, text: str) -> str:
         text = re.sub(r"\[.*?\]", " ", text)
